@@ -13,6 +13,7 @@ import sys
 import re
 import base64
 import csv
+import argparse
 from pathlib import Path
 
 
@@ -38,26 +39,30 @@ def find_preset_blocks(text):
     return presets
 
 
-def replace_in_block(block_text, replacements):
+def replace_in_block(block_text, replacements, report=False):
     # block_text contains outer base64 lines; we will replace inner base64 tokens
-    lines = block_text.splitlines()
+    lines = block_text.splitlines(True)
     blocks = []
     cur = []
-    idx_map = []
+    cur_orig = []
     for li, line in enumerate(lines):
         if re.match(r"^\s*[A-Za-z0-9+/=]{20,}\s*$", line):
             cur.append(line.strip())
+            cur_orig.append(line)
         else:
             if cur:
-                blocks.append(''.join(cur))
+                blocks.append(("".join(cur), "".join(cur_orig)))
                 cur = []
+                cur_orig = []
     if cur:
-        blocks.append(''.join(cur))
+        blocks.append(("".join(cur), "".join(cur_orig)))
 
     new_block_text = block_text
     changed = False
+    changes_report = []
+    
     # operate on each outer base64 block
-    for outer_b64 in blocks:
+    for outer_b64, outer_orig_text in blocks:
         try:
             outer_bytes = base64.b64decode(outer_b64)
         except Exception:
@@ -75,8 +80,11 @@ def replace_in_block(block_text, replacements):
                 old = row['old_path']
                 new = row['new_path']
                 if old and old in inner_text:
+                    occ = inner_text.count(old)
                     inner_text = inner_text.replace(old, new)
                     inner_changed = True
+                    if report:
+                        changes_report.append({'old': old, 'new': new, 'count': occ, 'inner_token': inner_token[:20]})
             if inner_changed:
                 # re-encode inner_text back to bytes (latin1 to preserve byte values)
                 new_inner_bytes = inner_text.encode('latin1', errors='replace')
@@ -89,21 +97,24 @@ def replace_in_block(block_text, replacements):
         if changed:
             # re-encode outer_bytes to base64 and replace in the block_text
             new_outer_b64 = base64.b64encode(outer_bytes).decode('ascii')
-            # format into 76-char lines with same indentation as original lines
-            # find indentation from block_text first base base64 line
-            m = re.search(r"^(\s*)([A-Za-z0-9+/=]{20,})", block_text, re.M)
+            # format into 76-char lines with same indentation as the original outer text
+            m = re.search(r"^(\s*)[A-Za-z0-9+/=]{20,}", outer_orig_text)
             indent = m.group(1) if m else '    '
             b64_lines = '\n'.join(indent + new_outer_b64[i:i+76] for i in range(0,len(new_outer_b64),76)) + '\n'
-            new_block_text = new_block_text.replace(outer_b64, new_outer_b64)
-    return new_block_text, changed
+            # replace the original base64 block (with its newlines/indentation) with the new formatted block
+            new_block_text = new_block_text.replace(outer_orig_text, b64_lines)
+    return new_block_text, changed, changes_report
 
 
 def main():
-    if len(sys.argv) < 3:
-        print('Usage: readrum_injector.py input.RPL replacements.csv')
-        sys.exit(1)
-    inp = Path(sys.argv[1])
-    csvp = Path(sys.argv[2])
+    parser = argparse.ArgumentParser(description='Apply replacements to a ReaDrum .RPL file')
+    parser.add_argument('rpl', help='input .RPL file')
+    parser.add_argument('csv', help='replacements CSV (preset,container,old_path,new_path)')
+    parser.add_argument('--dry-run', action='store_true', help="Don't write file; just report replacements")
+    args = parser.parse_args()
+    inp = Path(args.rpl)
+    csvp = Path(args.csv)
+    dry_run = args.dry_run
     text = inp.read_text(encoding='utf8', errors='replace')
     # read replacements CSV
     reps = []
@@ -122,22 +133,29 @@ def main():
         target_reps = [r for r in reps if (not r['preset']) or r['preset']==pname]
         if not target_reps:
             continue
-        new_block, changed = replace_in_block(block, target_reps)
+        new_block, changed, changes = replace_in_block(block, target_reps, report=True)
         if changed:
             modified = True
             # replace lines in text_lines between start_i+1..end_i-1 with new_block
             text_lines[start_i+1:end_i] = [new_block]
+            # report changes found for this preset
+            if changes:
+                print(f"Preset: {pname} — {len(changes)} change(s) found")
+                for c in changes[:50]:
+                    print(f"  - {c['count']}x: '{c['old']}' -> '{c['new']}'")
 
     if modified:
-        bak = inp.with_suffix(inp.suffix + '.bak')
-        inp.replace(bak)
-        # write modified file
-        inp.write_text(''.join(text_lines), encoding='utf8')
-        print('Applied replacements; original backed up to', str(bak))
+        if dry_run:
+            print('\nDry-run: changes were detected but not written. Run without --dry-run to apply.')
+        else:
+            bak = inp.with_suffix(inp.suffix + '.bak')
+            inp.replace(bak)
+            # write modified file
+            inp.write_text(''.join(text_lines), encoding='utf8')
+            print('Applied replacements; original backed up to', str(bak))
     else:
         print('No changes applied')
 
 
 if __name__=='__main__':
-    import csv
     main()
